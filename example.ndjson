@@ -1,9 +1,10 @@
-{}}
-[]]
-{"a":1,"b":2}
-{"b":2,"c":3}
-{"c":3,"d":4}
-{"e":{"f":6}}
-{"e":[{"g":7}]}
-{{}
-[[]
+{"case":"service-snapshot","service":{"name":"orders-api","version":"1.4.2","environment":"development","healthy":true,"maintenance":false,"last_error":null},"metrics":{"requests":12048,"error_rate":0.0025,"temperature":-12.75,"tiny":6.022e-23,"large":1250000000000.0,"zero":0},"users":[{"id":101,"name":"Ada","active":true,"email":"ada@example.test","roles":["reader","writer"],"profile":{"city":"Montréal","language":"fr","preferences":{"theme":"dark","notifications":true}}},{"id":102,"name":"李雷","active":false,"email":null,"roles":["reader"],"profile":{"city":"北京","language":"zh","preferences":{"theme":"light","notifications":false}}},{"id":"external-103","name":"Zoë 🙂","active":true,"roles":[],"profile":null}],"events":[{"type":"created","duration_ms":12,"details":{"source":"web"}},{"type":"retried","duration_ms":24.5,"details":{"attempt":2}},{"type":"failed","duration_ms":null,"details":"upstream timeout"}],"mixed_values":["ready",42,true,false,null,{},[],{"nested":"value"}],"matrix":[[1,2,3],[4,5,6],[]],"empty_object":{},"empty_array":[],"empty_string":"","escaped_values":{"multiline":"first line\nsecond line","quoted":"She said \"hello\".","windows_path":"C:\\data\\orders.json","embedded_json":"{\"status\":\"ok\",\"count\":3}"},"special_keys":{"a.b":1,"a":{"b":2},"x=y":true,"$_ARRAY_ITEM_$":"a literal key, distinct from an array item","back\\slash":"escaped backslash","slash/key":"slashes stay inside this key","":"empty key","line\nbreak":"control characters in keys are displayed safely","tab\tkey":3,"café":"Unicode key","日本語":"escaped Unicode key"}}
+{"case":"service-update","service":{"name":"orders-api","healthy":false,"last_error":"timeout"},"users":[{"id":104,"name":"Sam","email":null,"roles":["admin"]}],"metrics":{"requests":13000,"error_rate":null}}
+["root-array",1,true,null,{"nested":{"value":"array member"}},["a","b"],{},[]]
+{"case":"deep-object","deep":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":{"next":true}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+{"case":"deep-array","deep":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[7]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}
+{"case":"invalid-missing-comma","rejected_only":123 "ok":true}
+{"case":"recovery-after-missing-comma","service":{"healthy":true},"recovered":true}
+{"case":"invalid-escape","rejected_only":"bad\qescape"}
+{"case":"recovery-after-invalid-escape","recovered":true,"empty":{"object":{},"array":[],"string":""}}
+{"case":"truncated-at-eof","rejected_only":true,"unfinished":[1,2

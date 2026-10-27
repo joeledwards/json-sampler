@@ -1,10 +1,15 @@
 [package]
 name = "json-sampler"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.87"
 description = "Streaming JSON structure profiling for mixed-content streams"
 license = "MIT"
+repository = "https://github.com/joeledwards/json-sampler"
+readme = "README.md"
+keywords = ["json", "streaming", "profiling", "statistics", "cli"]
+categories = ["command-line-utilities", "parsing"]
+include = ["src/**", "docs/**", "README.md", "CHANGELOG.md", "LICENSE", "example.ndjson", "rust-toolchain.toml", "tools/**"]
 
 [features]
 default = ["cli"]

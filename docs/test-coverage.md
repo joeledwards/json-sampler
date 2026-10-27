@@ -21,22 +21,33 @@ each push.
 | Generated valid, invalid, truncated corpora across chunks | `bounded_volcano_corpus_matches_across_chunks` |
 | Exact NDJSON fixture, partial writes, EOF rejection | `final_report_handles_partial_writes_and_eof` |
 | Flat path/type occurrence maps, arrays, Unicode, empty/special keys, collision escaping, omitted roots | `flat_metrics_match_s3_sample_and_preserve_distinct_paths` |
-| Flat exact sorted collection, partial writes, EOF/SIGINT metadata, rejected rollback, output errors, CLI format selection | `flat_reports_have_exact_sorted_counts_and_preserve_interrupt_state` |
+| Flat exact sorted collection, partial writes, EOF/SIGINT metadata, rejected rollback, output errors, explicit flat/expanded and default human CLI format selection | `flat_reports_have_exact_sorted_counts_and_preserve_interrupt_state` |
 | Read errors, writer errors, broken pipes, flush failures | `io_errors_propagate` |
 | SIGINT request with pending candidate, confirmed-only totals, final-only mode | `interrupt_reports_pending_without_eof_and_ignores_queued_data` |
 | Idle interrupt wakeup, exactly one report, interrupt write/flush failures | `idle_interrupt_reports_and_writer_failures_propagate` |
+| Readable exact row fixture, numeric/colon alignment, safe controls, independent color/destination policy | `readable_rows_align_counts_and_escape_controls` |
+| Human sections/order, partial writes, live/EOF/SIGINT status, plain/styled output, writer/flush failures | `readable_reports_put_paths_before_separated_stream_metrics` |
+| FLON type palette, keys/array markers, default-color separators, escaped literal keys and controls | `path_components_and_types_use_consistent_colors_with_plain_separators` |
+| Bundled ten-row example: seven confirmed/three rejected, recovery, EOF, deep object/array maxima, cutoff comparison, one-byte chunks | `example_stream_covers_recovery_deep_documents_and_eof` |
+| Literal keys starting with `paths:` preserved in human output (regression failed before fix) | `human_report_preserves_keys_starting_with_metric_namespace` |
+| Compiled public-library usage | Crate-level doctest |
 | Interval validation | `intervals_are_bounded` |
+| Always-expanded JSON files regardless of stdout format, preserved occurrence/record counts, colored stream-only stdout, SIGINT pending state, partial file writes, CLI flags | `summary_file_gets_full_reports_and_terminal_only_stream_metrics` |
+| Periodic file reports and final-only suppression in both destinations | `summary_file_obeys_periodic_and_final_only_modes` |
+| File write/flush failures, terminal failure, continued file reporting after stdout broken pipe | `summary_file_survives_terminal_broken_pipe_and_propagates_failures` |
+| Observed depth beyond profiling cutoff, scalar depths, exact boundaries, commit/rollback, independent key/parser limits, chunk divisions | `encountered_depth_and_truncation_obey_confirmation_and_limits` |
+| Human confirmed/pending depth and explicit truncation status | `depth_reporting_distinguishes_confirmed_and_pending_truncation` |
 | Idle reporting and pending/final snapshots without sleeps | `periodic_snapshots_include_pending_input_and_idle_time` |
 
-Gaps: actual offset overflow at u64::MAX (impractical through public input),
-process-level signal and shell pipeline behavior, sustained performance and peak
-memory measurements, independent property/fuzz campaigns. These have not been
-run. Async input adapters, filters, embedded JSON, cross-sampler merging, and
-human output are outside the initial implementation.
+Process-level release checks live in `tools/check-release.py`. All ten were run
+against the 1.0.0 release binary on Linux: example/version, summary-file routing,
+idle SIGINT, final-only SIGINT with pending data, broken pipes with/without file
+output, file-open and file-write failures, redirected color/JSON, and PTY colors.
+The harness uses temporary files, bounded timeouts, and local processes only.
 
-Manual verification proposed, not run: build the CLI, pipe a stream that emits
-`{}[` and stays open into `json-sampler --final-only`, then send SIGINT to the
-sampler PID. Expect one NDJSON snapshot with `stop_reason: "sigint"`,
-`finished: false`, one confirmed candidate, one pending byte, no EOF rejection,
-and exit status 130. Repeat while stdin is idle and with periodic reporting.
-This checks actual OS signal wiring separately from isolated state/IO unit tests.
+Remaining gaps: actual offset overflow at u64::MAX (impractical through public
+input), cross-platform signal behavior, sustained performance/peak memory,
+and independent property/fuzz campaigns. Async adapters, filters, embedded JSON,
+and cross-sampler merging are outside the initial implementation.
+
+See [release validation](release-checklist.md) for reproducible commands.

@@ -1,7 +1,8 @@
 use clap::{Parser, ValueEnum};
 use json_sampler::{Config, Sampler};
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -51,7 +52,10 @@ mod interrupt {
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 enum Format {
     #[default]
-    Structured,
+    Human,
+    #[value(skip)]
+    HumanColor,
+    Expanded,
     Flat,
 }
 #[derive(Clone, Copy)]
@@ -59,13 +63,178 @@ struct OutputOptions {
     final_only: bool,
     format: Format,
 }
+#[cfg(test)]
 impl From<bool> for OutputOptions {
     fn from(final_only: bool) -> Self {
         Self {
             final_only,
-            format: Format::Structured,
+            format: Format::Flat,
         }
     }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Color {
+    Auto,
+    Always,
+    Never,
+}
+fn use_color(color: Color, terminal: bool, no_color: bool) -> bool {
+    match color {
+        Color::Always => true,
+        Color::Never => false,
+        Color::Auto => terminal && !no_color,
+    }
+}
+fn safe_label(text: &str) -> String {
+    text.chars()
+        .flat_map(|ch| {
+            if ch.is_control() {
+                ch.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![ch]
+            }
+        })
+        .collect()
+}
+fn colored_path(label: &str) -> String {
+    const RESET: &str = "\x1b[0m";
+    const BLUE: &str = "\x1b[34m";
+    const ORANGE: &str = "\x1b[38;5;208m";
+    let safe = safe_label(label);
+    let Some((path, kind)) = safe.rsplit_once('=') else {
+        return safe;
+    };
+    let mut result = String::new();
+    let mut component = String::new();
+    let mut escaped = false;
+    let append = |result: &mut String, part: &str| {
+        let color = if part == "$_ARRAY_ITEM_$" {
+            ORANGE
+        } else {
+            BLUE
+        };
+        result.push_str(color);
+        result.push_str(part);
+        result.push_str(RESET);
+    };
+    for ch in path.chars() {
+        if ch == '.' && !escaped {
+            append(&mut result, &component);
+            component.clear();
+            result.push('.');
+        } else {
+            component.push(ch);
+        }
+        escaped = ch == '\\' && !escaped;
+    }
+    append(&mut result, &component);
+    result.push('=');
+    let color = match kind {
+        "OBJECT" => BLUE,
+        "ARRAY" | "NUMBER" => ORANGE,
+        "STRING" => "\x1b[32m",
+        "BOOLEAN" => "\x1b[35m",
+        "NULL" => "\x1b[33m",
+        _ => "",
+    };
+    result.push_str(color);
+    result.push_str(kind);
+    result.push_str(RESET);
+    result
+}
+
+fn rows(
+    writer: &mut impl Write,
+    title: &str,
+    rows: &[(String, u64)],
+    color: bool,
+    path_colors: bool,
+) -> io::Result<()> {
+    let (heading, number, reset) = if color {
+        ("\x1b[1;36m", "\x1b[38;5;208m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    writeln!(writer, "{heading}{title}{reset}")?;
+    if rows.is_empty() {
+        writeln!(writer, "  (none)")?;
+    }
+    let width = rows
+        .iter()
+        .map(|(_, n)| n.to_string().len())
+        .max()
+        .unwrap_or(1);
+    for (label, count) in rows {
+        writeln!(
+            writer,
+            "  {number}{count:>width$}{reset} : {}",
+            if color && path_colors {
+                colored_path(label)
+            } else {
+                safe_label(label)
+            }
+        )?;
+    }
+    Ok(())
+}
+fn human_report(
+    writer: &mut impl Write,
+    snapshot: &json_sampler::Snapshot,
+    color: bool,
+    stop_reason: Option<&str>,
+) -> io::Result<()> {
+    human_report_parts(writer, snapshot, color, stop_reason, true)
+}
+fn human_report_parts(
+    writer: &mut impl Write,
+    snapshot: &json_sampler::Snapshot,
+    color: bool,
+    stop_reason: Option<&str>,
+    include_paths: bool,
+) -> io::Result<()> {
+    let status = if stop_reason.is_some() {
+        "interrupted"
+    } else if snapshot.finished {
+        "complete"
+    } else {
+        "live"
+    };
+    writeln!(writer, "JSON sampler ({status})")?;
+    if include_paths {
+        let counts = snapshot
+            .flat_metrics()
+            .into_iter()
+            .map(|(path, n)| (path.strip_prefix("paths:").unwrap_or(&path).to_owned(), n))
+            .collect::<Vec<_>>();
+        rows(writer, "Path counts", &counts, color, true)?;
+        writeln!(writer)?;
+    }
+    let stream = serde_json::to_value(&snapshot.stream)?;
+    let mut metrics = Vec::new();
+    for (key, value) in stream
+        .as_object()
+        .expect("stream statistics serialize as an object")
+    {
+        if let Some(count) = value.as_u64() {
+            metrics.push((key.replace('_', " "), count));
+        }
+    }
+    for (kind, count) in &snapshot.stream.errors {
+        metrics.push((format!("errors: {kind}"), *count));
+    }
+    rows(writer, "Stream metrics", &metrics, color, false)?;
+    writeln!(
+        writer,
+        "  pending depth truncated : {}",
+        if snapshot.stream.pending_depth_truncated {
+            "yes"
+        } else {
+            "no"
+        }
+    )?;
+    writeln!(writer)?;
+    writer.flush()
 }
 
 #[derive(Parser)]
@@ -74,13 +243,19 @@ impl From<bool> for OutputOptions {
     about = "Profile every JSON object/array candidate in a mixed stdin stream"
 )]
 struct Args {
-    /// Collection format: structured path/type entries or S3-sample-style counts.
-    #[arg(long, value_enum, default_value = "structured")]
+    /// Stdout format without --summary-file: human (default), flat JSON, or expanded JSON.
+    #[arg(long, value_enum, default_value = "human")]
     format: Format,
+    /// Color human reports automatically on terminals, always, or never.
+    #[arg(long, value_enum, default_value = "auto")]
+    color: Color,
     /// Seconds between cumulative JSON snapshots, including while input is idle.
     #[arg(long, default_value = "5", value_parser = interval)]
     interval: Duration,
-    /// Emit only the final snapshot at EOF.
+    /// Write full expanded JSON reports to this file; stdout shows readable stream metrics.
+    #[arg(long)]
+    summary_file: Option<PathBuf>,
+    /// Emit only the final report at EOF or SIGINT.
     #[arg(long)]
     final_only: bool,
     #[arg(long, default_value = "1000")]
@@ -116,6 +291,14 @@ fn write_report(
     stop_reason: Option<&str>,
 ) -> io::Result<()> {
     let snapshot = sampler.snapshot();
+    if matches!(format, Format::Human | Format::HumanColor) {
+        return human_report(
+            writer,
+            &snapshot,
+            matches!(format, Format::HumanColor),
+            stop_reason,
+        );
+    }
     #[derive(serde::Serialize)]
     struct Report<'a, M> {
         finished: bool,
@@ -125,7 +308,8 @@ fn write_report(
         stop_reason: Option<&'a str>,
     }
     match format {
-        Format::Structured => serde_json::to_writer(
+        Format::Human | Format::HumanColor => unreachable!(),
+        Format::Expanded => serde_json::to_writer(
             &mut *writer,
             &Report {
                 finished: snapshot.finished,
@@ -147,13 +331,53 @@ fn write_report(
     writer.write_all(b"\n")?;
     writer.flush()
 }
+trait ReportSink {
+    fn emit(&mut self, sampler: &Sampler, format: Format, reason: Option<&str>) -> io::Result<()>;
+}
+impl<W: Write> ReportSink for W {
+    fn emit(&mut self, sampler: &Sampler, format: Format, reason: Option<&str>) -> io::Result<()> {
+        write_report(self, sampler, format, reason)
+    }
+}
+struct FileReports<F, T> {
+    file: F,
+    terminal: T,
+    terminal_color: bool,
+    terminal_closed: bool,
+}
+fn file_error(error: io::Error) -> io::Error {
+    // File failures are fatal even when their underlying kind is BrokenPipe.
+    io::Error::other(format!("summary file: {error}"))
+}
+impl<F: Write, T: Write> ReportSink for FileReports<F, T> {
+    fn emit(&mut self, sampler: &Sampler, _format: Format, reason: Option<&str>) -> io::Result<()> {
+        write_report(&mut self.file, sampler, Format::Expanded, reason).map_err(file_error)?;
+        if !self.terminal_closed {
+            if let Err(error) = human_report_parts(
+                &mut self.terminal,
+                &sampler.snapshot(),
+                self.terminal_color,
+                reason,
+                false,
+            ) {
+                if error.kind() == io::ErrorKind::BrokenPipe {
+                    self.terminal_closed = true;
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 fn report(writer: &mut impl Write, sampler: &Sampler) -> io::Result<()> {
-    write_report(writer, sampler, Format::Structured, None)
+    write_report(writer, sampler, Format::Expanded, None)
 }
 fn consume(
     receiver: mpsc::Receiver<io::Result<Vec<u8>>>,
-    writer: &mut impl Write,
+    writer: &mut impl ReportSink,
     sampler: &mut Sampler,
     interval: Duration,
     options: impl Into<OutputOptions>,
@@ -175,7 +399,7 @@ fn consume_with(
     mut receive: impl FnMut(Option<Duration>) -> Result<io::Result<Vec<u8>>, RecvTimeoutError>,
     mut now: impl FnMut() -> Instant,
     mut interrupted: impl FnMut() -> bool,
-    writer: &mut impl Write,
+    writer: &mut impl ReportSink,
     sampler: &mut Sampler,
     interval: Duration,
     options: impl Into<OutputOptions>,
@@ -184,11 +408,11 @@ fn consume_with(
     let mut deadline = now() + interval;
     loop {
         if interrupted() {
-            write_report(writer, sampler, format, Some("sigint"))?;
+            writer.emit(sampler, format, Some("sigint"))?;
             return Ok(Stop::Interrupted);
         }
         if !final_only && now() >= deadline {
-            write_report(writer, sampler, format, None)?;
+            writer.emit(sampler, format, None)?;
             deadline = now() + interval;
         }
         // Bound waits even in --final-only mode so a blocked reader cannot
@@ -204,7 +428,7 @@ fn consume_with(
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => {
                 sampler.finish();
-                write_report(writer, sampler, format, None)?;
+                writer.emit(sampler, format, None)?;
                 return Ok(Stop::Eof);
             }
         }
@@ -220,6 +444,17 @@ fn run(args: Args) -> io::Result<Stop> {
         max_key_bytes: args.max_key_bytes,
         max_path_bytes: args.max_path_bytes,
     });
+    let summary_file = args
+        .summary_file
+        .as_ref()
+        .map(std::fs::File::create)
+        .transpose()
+        .map_err(file_error)?;
+    let terminal_color = use_color(
+        args.color,
+        io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").is_some_and(|s| !s.is_empty()),
+    );
     // Bounded read-ahead. A stdin reader blocked at shutdown is detached;
     // process exit releases it, including when downstream closes its pipe.
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -242,16 +477,26 @@ fn run(args: Args) -> io::Result<Stop> {
             }
         }
     });
-    consume(
-        receiver,
-        &mut io::stdout().lock(),
-        &mut sampler,
-        args.interval,
-        OutputOptions {
-            final_only: args.final_only,
-            format: args.format,
+    let options = OutputOptions {
+        final_only: args.final_only,
+        format: if matches!(args.format, Format::Human) && terminal_color {
+            Format::HumanColor
+        } else {
+            args.format
         },
-    )
+    };
+    let mut stdout = io::stdout().lock();
+    if let Some(file) = summary_file {
+        let mut reports = FileReports {
+            file,
+            terminal: &mut stdout,
+            terminal_color,
+            terminal_closed: false,
+        };
+        consume(receiver, &mut reports, &mut sampler, args.interval, options)
+    } else {
+        consume(receiver, &mut stdout, &mut sampler, args.interval, options)
+    }
 }
 fn main() -> std::process::ExitCode {
     match run(Args::parse()) {
@@ -320,8 +565,8 @@ mod tests {
             "\"confirmed_bytes\":2,\"rejected_bytes\":1,\"pending_bytes\":0,",
             "\"candidates_started\":2,\"candidates_confirmed\":1,\"candidates_rejected\":1,",
             "\"candidates_pending\":0,\"candidates_incomplete_at_eof\":1,",
-            "\"candidates_profile_limited\":0,\"candidates_key_decode_errors\":0,\"errors\":{\"UnexpectedEnd\":1}},",
-            "\"metrics\":[{\"path\":[],\"value_type\":\"object\",\"counts\":{\"occurrences\":1,\"records\":1}}]}\n"
+            "\"candidates_profile_limited\":0,\"candidates_key_decode_errors\":0,\"max_depth_encountered\":0,\"candidates_depth_truncated\":0,\"pending_max_depth\":0,\"pending_depth_truncated\":false,\"errors\":{\"UnexpectedEnd\":1}},",
+            "\"metrics\":{}}\n"
         );
         assert_eq!(String::from_utf8(writer.bytes).unwrap(), expected);
     }
@@ -426,7 +671,7 @@ mod tests {
             assert_eq!(report["stream"]["pending_bytes"], 2);
             assert_eq!(report["stream"]["candidates_rejected"], 0);
             assert_eq!(report["stream"]["candidates_incomplete_at_eof"], 0);
-            assert_eq!(report["metrics"].as_array().unwrap().len(), 1);
+            assert!(report["metrics"].as_object().unwrap().is_empty());
         }
     }
     #[test]
@@ -528,8 +773,302 @@ mod tests {
         assert!(matches!(args.format, Format::Flat));
         assert!(matches!(
             Args::try_parse_from(["json-sampler"]).unwrap().format,
-            Format::Structured
+            Format::Human
         ));
+        assert!(matches!(
+            Args::try_parse_from(["json-sampler", "--format", "expanded"])
+                .unwrap()
+                .format,
+            Format::Expanded
+        ));
+        let mut expanded = vec![];
+        write_report(&mut expanded, &sampler, Format::Expanded, None).unwrap();
+        let expanded: serde_json::Value = serde_json::from_slice(&expanded).unwrap();
+        assert!(expanded["metrics"].is_array());
         assert!(Args::try_parse_from(["json-sampler", "--format", "unknown"]).is_err());
+    }
+    #[test]
+    fn readable_rows_align_counts_and_escape_controls() {
+        let rows_data = vec![
+            ("a=NUMBER".into(), 2),
+            ("b=STRING".into(), 1000),
+            ("bad\n\x1b".into(), 0),
+        ];
+        let mut plain = vec![];
+        rows(&mut plain, "Path counts", &rows_data, false, false).unwrap();
+        assert_eq!(
+            String::from_utf8(plain.clone()).unwrap(),
+            "Path counts\n     2 : a=NUMBER\n  1000 : b=STRING\n     0 : bad\\n\\u{1b}\n"
+        );
+        let mut colored = vec![];
+        rows(&mut colored, "Path counts", &rows_data, true, false).unwrap();
+        let colored = String::from_utf8(colored).unwrap();
+        assert!(colored.starts_with("\x1b[1;36mPath counts\x1b[0m\n"));
+        assert!(colored.contains("\x1b[38;5;208m   2\x1b[0m : a=NUMBER"));
+        assert_eq!(
+            colored
+                .replace("\x1b[1;36m", "")
+                .replace("\x1b[38;5;208m", "")
+                .replace("\x1b[0m", "")
+                .as_bytes(),
+            plain
+        );
+        assert!(use_color(Color::Auto, true, false));
+        assert!(!use_color(Color::Auto, false, false));
+        assert!(!use_color(Color::Auto, true, true));
+        assert!(use_color(Color::Always, false, true));
+        assert!(!use_color(Color::Never, true, false));
+    }
+    #[test]
+    fn readable_reports_put_paths_before_separated_stream_metrics() {
+        let mut sampler = Sampler::default();
+        sampler.push(br#"{"a":[1,2]}["#);
+        for (format, reason, status) in [
+            (Format::Human, None, "live"),
+            (Format::HumanColor, Some("sigint"), "interrupted"),
+        ] {
+            let mut writer = Writer {
+                bytes: vec![],
+                fail: None,
+                flush_fail: false,
+            };
+            write_report(&mut writer, &sampler, format, reason).unwrap();
+            let text = String::from_utf8(writer.bytes).unwrap();
+            assert!(text.starts_with(&format!("JSON sampler ({status})\n")));
+            assert!(text.find("Path counts").unwrap() < text.find("Stream metrics").unwrap());
+            let plain = [
+                "\x1b[0m",
+                "\x1b[34m",
+                "\x1b[38;5;208m",
+                "\x1b[32m",
+                "\x1b[35m",
+                "\x1b[33m",
+                "\x1b[1;36m",
+            ]
+            .iter()
+            .fold(text.clone(), |text, code| text.replace(code, ""));
+            assert!(plain.contains("a.$_ARRAY_ITEM_$=NUMBER"));
+            assert!(text.contains("\n\n"));
+            assert!(text.replace("\x1b[0m", "").contains("1 : pending bytes"));
+            for fail in [Some(io::ErrorKind::BrokenPipe), None] {
+                let mut writer = Writer {
+                    bytes: vec![],
+                    fail,
+                    flush_fail: fail.is_none(),
+                };
+                assert!(write_report(&mut writer, &sampler, format, reason).is_err());
+            }
+        }
+        sampler.finish();
+        let mut output = vec![];
+        write_report(&mut output, &sampler, Format::Human, None).unwrap();
+        assert!(output.starts_with(b"JSON sampler (complete)\n"));
+        assert!(!output.contains(&0x1b));
+    }
+    #[test]
+    fn path_components_and_types_use_consistent_colors_with_plain_separators() {
+        for (kind, color) in [
+            ("OBJECT", "\x1b[34m"),
+            ("ARRAY", "\x1b[38;5;208m"),
+            ("NUMBER", "\x1b[38;5;208m"),
+            ("STRING", "\x1b[32m"),
+            ("BOOLEAN", "\x1b[35m"),
+            ("NULL", "\x1b[33m"),
+        ] {
+            assert_eq!(
+                colored_path(&format!("a.$_ARRAY_ITEM_$.b={kind}")),
+                format!(
+                    "\x1b[34ma\x1b[0m.\x1b[38;5;208m$_ARRAY_ITEM_$\x1b[0m.\x1b[34mb\x1b[0m={color}{kind}\x1b[0m"
+                )
+            );
+        }
+        assert_eq!(
+            colored_path(r"a\.b.\$_ARRAY_ITEM_\$=STRING"),
+            "\x1b[34ma\\.b\x1b[0m.\x1b[34m\\$_ARRAY_ITEM_\\$\x1b[0m=\x1b[32mSTRING\x1b[0m"
+        );
+        let unsafe_key = colored_path("a\n\x1b=STRING");
+        assert!(unsafe_key.contains(r"a\n\u{1b}"));
+    }
+    #[test]
+    fn depth_reporting_distinguishes_confirmed_and_pending_truncation() {
+        let mut sampler = Sampler::new(Config {
+            profile_depth: 1,
+            ..Config::default()
+        });
+        sampler.push(b"[[0");
+        let mut text = vec![];
+        write_report(&mut text, &sampler, Format::Human, None).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("2 : pending max depth"));
+        assert!(text.contains("0 : max depth encountered"));
+        assert!(text.contains("pending depth truncated : yes"));
+        sampler.push(b"]]");
+        let mut text = vec![];
+        write_report(&mut text, &sampler, Format::Human, None).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("2 : max depth encountered"));
+        assert!(text.contains("1 : candidates depth truncated"));
+        assert!(text.contains("pending depth truncated : no"));
+    }
+    #[test]
+    fn human_report_preserves_keys_starting_with_metric_namespace() {
+        let mut sampler = Sampler::default();
+        sampler.push(br#"{"paths:x":1,"x":2}"#);
+        sampler.finish();
+        let mut output = vec![];
+        write_report(&mut output, &sampler, Format::Human, None).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("1 : paths:x=NUMBER\n"));
+        assert!(output.contains("1 : x=NUMBER\n"));
+    }
+    #[test]
+    fn summary_file_gets_full_reports_and_terminal_only_stream_metrics() {
+        for format in [
+            Format::Human,
+            Format::HumanColor,
+            Format::Flat,
+            Format::Expanded,
+        ] {
+            let mut sampler = Sampler::default();
+            sampler.push(br#"{"a":[1,2]}["#);
+            let mut reports = FileReports {
+                file: Writer {
+                    bytes: vec![],
+                    fail: None,
+                    flush_fail: false,
+                },
+                terminal: vec![],
+                terminal_color: true,
+                terminal_closed: false,
+            };
+            reports.emit(&sampler, format, Some("sigint")).unwrap();
+            let terminal = String::from_utf8(reports.terminal).unwrap();
+            assert!(terminal.contains("Stream metrics"));
+            assert!(terminal.contains("pending bytes"));
+            assert!(!terminal.contains("Path counts"));
+            assert!(!terminal.contains("a.$_ARRAY_ITEM_$"));
+            assert!(terminal.contains("\x1b["));
+            assert!(!reports.file.bytes.contains(&0x1b));
+            let file = String::from_utf8(reports.file.bytes).unwrap();
+            assert!(file.contains("a"));
+            let value: serde_json::Value = serde_json::from_str(&file).unwrap();
+            assert_eq!(value["stop_reason"], "sigint");
+            assert_eq!(value["stream"]["pending_bytes"], 1);
+            assert_eq!(value["finished"], false);
+            let metrics = value["metrics"].as_array().unwrap();
+            assert_eq!(metrics.len(), 3);
+            let number = metrics
+                .iter()
+                .find(|metric| metric["value_type"] == "number")
+                .unwrap();
+            assert_eq!(number["counts"]["occurrences"], 2);
+            assert_eq!(number["counts"]["records"], 1);
+            assert_eq!(file.lines().count(), 1);
+        }
+        let args = Args::try_parse_from([
+            "json-sampler",
+            "--summary-file",
+            "report.txt",
+            "--final-only",
+        ])
+        .unwrap();
+        assert_eq!(args.summary_file, Some(PathBuf::from("report.txt")));
+        assert!(args.final_only);
+    }
+    #[test]
+    fn summary_file_obeys_periodic_and_final_only_modes() {
+        use std::cell::Cell;
+        for final_only in [false, true] {
+            let clock = Cell::new(Instant::now());
+            let mut step = 0;
+            let mut reports = FileReports {
+                file: vec![],
+                terminal: vec![],
+                terminal_color: false,
+                terminal_closed: false,
+            };
+            consume_with(
+                |_| {
+                    step += 1;
+                    match step {
+                        1 => Ok(Ok(br#"{"a":1}"#.to_vec())),
+                        2 => {
+                            clock.set(clock.get() + Duration::from_secs(10));
+                            Err(RecvTimeoutError::Timeout)
+                        }
+                        _ => Err(RecvTimeoutError::Disconnected),
+                    }
+                },
+                || clock.get(),
+                || false,
+                &mut reports,
+                &mut Sampler::default(),
+                Duration::from_secs(5),
+                OutputOptions {
+                    final_only,
+                    format: Format::Expanded,
+                },
+            )
+            .unwrap();
+            let values = serde_json::Deserializer::from_slice(&reports.file)
+                .into_iter::<serde_json::Value>()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(values.len(), if final_only { 1 } else { 2 });
+            assert_eq!(values.last().unwrap()["finished"], true);
+            let terminal = String::from_utf8(reports.terminal).unwrap();
+            assert_eq!(terminal.matches("Stream metrics").count(), values.len());
+            assert!(!terminal.contains("Path counts"));
+        }
+    }
+    #[test]
+    fn summary_file_survives_terminal_broken_pipe_and_propagates_failures() {
+        let mut sampler = Sampler::default();
+        sampler.push(b"{}");
+        let mut reports = FileReports {
+            file: vec![],
+            terminal: Writer {
+                bytes: vec![],
+                fail: Some(io::ErrorKind::BrokenPipe),
+                flush_fail: false,
+            },
+            terminal_color: false,
+            terminal_closed: false,
+        };
+        reports.emit(&sampler, Format::Expanded, None).unwrap();
+        sampler.finish();
+        reports.emit(&sampler, Format::Expanded, None).unwrap();
+        assert_eq!(reports.file.iter().filter(|&&b| b == b'\n').count(), 2);
+        for fail in [
+            Some(io::ErrorKind::BrokenPipe),
+            Some(io::ErrorKind::PermissionDenied),
+            None,
+        ] {
+            let mut reports = FileReports {
+                file: Writer {
+                    bytes: vec![],
+                    fail,
+                    flush_fail: fail.is_none(),
+                },
+                terminal: vec![],
+                terminal_color: false,
+                terminal_closed: false,
+            };
+            let error = reports.emit(&sampler, Format::Expanded, None).unwrap_err();
+            assert_ne!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert!(reports.terminal.is_empty());
+        }
+        let mut reports = FileReports {
+            file: vec![],
+            terminal: Writer {
+                bytes: vec![],
+                fail: None,
+                flush_fail: true,
+            },
+            terminal_color: false,
+            terminal_closed: false,
+        };
+        assert!(reports.emit(&sampler, Format::Expanded, None).is_err());
+        assert!(!reports.file.is_empty());
     }
 }

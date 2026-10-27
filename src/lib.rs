@@ -1,4 +1,15 @@
 //! Incremental structure profiling. Only confirmed candidates enter path totals.
+//!
+//! ```
+//! use json_sampler::Sampler;
+//! let mut sampler = Sampler::default();
+//! sampler.push(b"noise {\"items\":[1,");
+//! assert!(sampler.snapshot().metrics.is_empty());
+//! sampler.push(b"2]}");
+//! assert_eq!(sampler.snapshot().stream.candidates_confirmed, 1);
+//! sampler.finish();
+//! assert!(sampler.snapshot().finished);
+//! ```
 use json_skimmer::{ErrorKind, Event, Mode, Parser, StringKind};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -7,10 +18,13 @@ use std::num::{NonZeroU64, NonZeroUsize};
 /// Resource limits. Each aggregation map retains at most `max_paths` entries.
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Parser container-depth limit; root counts as one. Exceeding it rejects the candidate.
     pub max_depth: NonZeroUsize,
+    /// Optional raw-byte candidate limit, including delimiters and internal whitespace.
     pub max_candidate_bytes: Option<NonZeroU64>,
     /// Root is depth zero; this only limits profiling, not validation.
     pub profile_depth: usize,
+    /// Maximum distinct path/type entries in each of the two aggregation maps.
     pub max_paths: NonZeroUsize,
     /// Maximum raw JSON bytes retained for any one key (excluding quotes).
     pub max_key_bytes: usize,
@@ -39,6 +53,7 @@ pub enum Segment {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
+/// The six JSON value types, independent of number spelling or scalar contents.
 pub enum ValueType {
     Object,
     Array,
@@ -51,6 +66,7 @@ type MetricKey = (Vec<Segment>, ValueType);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct Counts {
+    /// Number of observed values of this path/type in confirmed candidates.
     pub occurrences: u64,
     /// Number of confirmed candidates containing this path/type at least once.
     pub records: u64,
@@ -77,6 +93,14 @@ pub struct StreamStats {
     pub candidates_profile_limited: u64,
     /// Confirmed candidates with keys that cannot be decoded as Unicode strings.
     pub candidates_key_decode_errors: u64,
+    /// Maximum value depth in confirmed candidates; root is zero.
+    pub max_depth_encountered: usize,
+    /// Confirmed candidates containing values deeper than `profile_depth`.
+    pub candidates_depth_truncated: u64,
+    /// Maximum value depth seen in the current candidate; zero when absent.
+    pub pending_max_depth: usize,
+    /// Whether the current candidate contains values beyond `profile_depth`.
+    pub pending_depth_truncated: bool,
     pub errors: BTreeMap<String, u64>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -144,6 +168,8 @@ struct Aggregator {
     key_overflow: bool,
     limited: bool,
     key_decode_error: bool,
+    max_depth: usize,
+    depth_truncated: bool,
     // A rejected byte can be reused as the next candidate's opener.
     rejected_end: Option<u64>,
 }
@@ -155,6 +181,7 @@ pub struct Sampler {
     finished: bool,
 }
 impl Sampler {
+    /// Construct a scan-mode sampler with explicit parsing and profiling limits.
     pub fn new(config: Config) -> Self {
         Self {
             parser: Parser::with_limits(Mode::Scan, config.max_depth, config.max_candidate_bytes),
@@ -169,6 +196,8 @@ impl Sampler {
                 key_overflow: false,
                 limited: false,
                 key_decode_error: false,
+                max_depth: 0,
+                depth_truncated: false,
                 rejected_end: None,
             },
             finished: false,
@@ -216,12 +245,26 @@ impl Aggregator {
         self.stats.consumed_bytes = consumed;
         self.stats.pending_bytes = self.start.map_or(0, |start| consumed - start);
         self.stats.candidates_pending = u64::from(self.start.is_some());
+        self.stats.pending_max_depth = if self.start.is_some() {
+            self.max_depth
+        } else {
+            0
+        };
+        self.stats.pending_depth_truncated = self.start.is_some() && self.depth_truncated;
         self.stats.outside_bytes = consumed
             - self.stats.confirmed_bytes
             - self.stats.rejected_bytes
             - self.stats.pending_bytes;
     }
     fn value(&mut self, value_type: ValueType) -> Option<Vec<Segment>> {
+        // Container frames remain available even when retained paths are omitted.
+        // This counts scalar leaves too, independently of path/key/cardinality caps.
+        let depth = self.frames.len();
+        self.max_depth = self.max_depth.max(depth);
+        if depth > self.config.profile_depth {
+            self.depth_truncated = true;
+            self.limited = true;
+        }
         let mut path = match self.frames.last_mut() {
             None => Some(Vec::new()),
             Some(frame) => frame.path.clone().and_then(|mut path| {
@@ -274,6 +317,8 @@ impl Aggregator {
                 self.frames.clear();
                 self.limited = false;
                 self.key_decode_error = false;
+                self.max_depth = 0;
+                self.depth_truncated = false;
             }
             Event::ObjectStart { .. } => {
                 let path = self.value(ValueType::Object);
@@ -372,6 +417,9 @@ impl Aggregator {
                 }
                 self.stats.candidates_profile_limited += u64::from(self.limited);
                 self.stats.candidates_key_decode_errors += u64::from(self.key_decode_error);
+                self.stats.max_depth_encountered =
+                    self.stats.max_depth_encountered.max(self.max_depth);
+                self.stats.candidates_depth_truncated += u64::from(self.depth_truncated);
                 self.start = None;
                 self.frames.clear();
                 self.key.clear();
@@ -772,5 +820,103 @@ mod tests {
         ]);
         assert_eq!(flat, expected);
         assert!(Sampler::default().snapshot().flat_metrics().is_empty());
+    }
+    #[test]
+    fn encountered_depth_and_truncation_obey_confirmation_and_limits() {
+        for (input, limit, depth, truncated) in [
+            (&b"{}"[..], 0, 0, 0),
+            (b"{\"a\":{}}", 1, 1, 0),
+            (b"{\"a\":[[1]]}", 3, 3, 0),
+            (b"{\"a\":[[1]]}", 1, 3, 1),
+        ] {
+            let s = splits(
+                input,
+                Config {
+                    profile_depth: limit,
+                    ..Config::default()
+                },
+            );
+            assert_eq!(s.stream.max_depth_encountered, depth);
+            assert_eq!(s.stream.candidates_depth_truncated, truncated);
+            assert_eq!(s.stream.candidates_profile_limited, truncated);
+            assert_eq!(s.stream.pending_max_depth, 0);
+            assert!(!s.stream.pending_depth_truncated);
+        }
+        let mut sampler = Sampler::new(Config {
+            profile_depth: 1,
+            ..Config::default()
+        });
+        sampler.push(b"[[[1");
+        let s = sampler.snapshot();
+        assert_eq!(s.stream.max_depth_encountered, 0);
+        assert_eq!(s.stream.pending_max_depth, 3);
+        assert!(s.stream.pending_depth_truncated);
+        assert_eq!(s.stream.candidates_depth_truncated, 0);
+        sampler.push(b"]]]");
+        assert_eq!(sampler.snapshot().stream.max_depth_encountered, 3);
+        assert_eq!(sampler.snapshot().stream.candidates_depth_truncated, 1);
+        sampler.push(b"[[[[[0");
+        sampler.finish();
+        let s = sampler.snapshot();
+        assert_eq!(s.stream.max_depth_encountered, 3);
+        assert_eq!(s.stream.candidates_depth_truncated, 1);
+        assert_eq!(s.stream.pending_max_depth, 0);
+        assert!(!s.stream.pending_depth_truncated);
+        let s = splits(
+            br#"{"long":{"x":[0]}}"#,
+            Config {
+                max_key_bytes: 1,
+                profile_depth: 1,
+                ..Config::default()
+            },
+        );
+        assert_eq!(s.stream.max_depth_encountered, 3);
+        assert_eq!(s.stream.candidates_depth_truncated, 1);
+        let s = splits(
+            b"[[]]{}",
+            Config {
+                max_depth: NonZeroUsize::new(1).unwrap(),
+                profile_depth: 0,
+                ..Config::default()
+            },
+        );
+        assert_eq!(s.stream.max_depth_encountered, 0);
+        assert_eq!(s.stream.candidates_depth_truncated, 0);
+    }
+    #[test]
+    fn example_stream_covers_recovery_deep_documents_and_eof() {
+        let input = include_bytes!("../example.ndjson");
+        for limit in [32, 64] {
+            let config = Config {
+                profile_depth: limit,
+                ..Config::default()
+            };
+            let s = run(input, config.clone(), &[]);
+            assert_eq!(run(input, config, &vec![1; input.len()]), s);
+            assert_eq!(s.stream.candidates_confirmed, 7);
+            assert_eq!(s.stream.candidates_rejected, 3);
+            assert_eq!(s.stream.candidates_incomplete_at_eof, 1);
+            assert_eq!(s.stream.max_depth_encountered, 49);
+            assert_eq!(
+                s.stream.candidates_depth_truncated,
+                if limit == 32 { 2 } else { 0 }
+            );
+            assert_eq!(
+                s.stream.candidates_profile_limited,
+                if limit == 32 { 2 } else { 0 }
+            );
+            assert_eq!(s.stream.errors["UnexpectedByte"], 1);
+            assert_eq!(s.stream.errors["InvalidEscape"], 1);
+            assert_eq!(s.stream.errors["UnexpectedEnd"], 1);
+            assert!(
+                !s.metrics
+                    .iter()
+                    .any(|m| m.path.contains(&key("rejected_only")))
+            );
+            assert_eq!(
+                metric(&s, &[key("recovered")], ValueType::Boolean).records,
+                2
+            );
+        }
     }
 }
