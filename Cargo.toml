@@ -1,0 +1,28 @@
+[package]
+name = "json-sampler"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "Streaming JSON structure profiling for mixed-content streams"
+license = "MIT"
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:libc"]
+
+[dependencies]
+json-skimmer = "1.0.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4.5", features = ["derive"], optional = true }
+
+[dev-dependencies]
+json-volcano = { version = "1.0.0", default-features = false }
+
+[[bin]]
+name = "json-sampler"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
